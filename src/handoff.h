@@ -30,6 +30,7 @@
 #define HANDOFF_MAX_BLOCK_DEVICES 32
 #define HANDOFF_MAX_CPU_RANGES 64
 #define HANDOFF_MAX_BOOT_ORDER 4096
+#define HANDOFF_FLOPPY_MODEL_MAX 256
 
 struct handoff_range {
     uint64_t base;
@@ -167,6 +168,8 @@ struct handoff_config {
     // Whether the hypervisor has the USB controllers until the OS takes them
     // (virt/usb.c), else the OS has them from the start.
     uint8_t legacy_usb;
+    // Model substring of an ATAPI LS-120 to reserve as BIOS drive 00h.
+    char floppy_a[HANDOFF_FLOPPY_MODEL_MAX];
     // Which APIC IDs the guest gets, as inclusive ranges.
     uint32_t cpu_filter;
     uint32_t cpu_range_count;

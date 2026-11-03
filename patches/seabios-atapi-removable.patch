@@ -1,0 +1,835 @@
+diff --git a/src/block.h b/src/block.h
+index 130225f0..f17225aa 100644
+--- a/src/block.h
++++ b/src/block.h
+@@ -47,6 +47,7 @@ struct chs_s {
+ 
+ struct drive_s {
+     u8 type;            // Driver type (DTYPE_*)
++    u8 floppy_a;        // Reserve BIOS floppy drive 00h for this device.
+     u8 floppy_type;     // Type of floppy (only for floppy drives).
+     struct chs_s lchs;  // Logical CHS
+     u64 sectors;        // Total sectors count
+diff --git a/src/boot.c b/src/boot.c
+index fb494577..0dd4c540 100644
+--- a/src/boot.c
++++ b/src/boot.c
+@@ -835,8 +835,13 @@ add_bev(int type, u32 vector)
+ {
+     if (type == IPL_TYPE_HARDDISK && HaveHDBoot++)
+         return;
+-    if (type == IPL_TYPE_FLOPPY && HaveFDBoot++)
+-        return;
++    if (type == IPL_TYPE_FLOPPY) {
++        int i;
++        for (i = 0; i < BEVCount; i++)
++            if (BEV[i].type == type && BEV[i].vector == vector)
++                return;
++        HaveFDBoot++;
++    }
+     if (BEVCount >= ARRAY_SIZE(BEV))
+         return;
+     struct bev_s *bev = &BEV[BEVCount++];
+@@ -855,8 +860,21 @@ bcv_prepboot(void)
+     if (haltprio >= 0)
+         bootentry_add(IPL_TYPE_HALT, haltprio, 0, "HALT");
+ 
++    // Reserve a configured ATAPI floppy as A: independently of boot order.
++    struct bootentry_s *pos, *floppy_a = NULL;
++    int matches = 0;
++    hlist_for_each_entry(pos, &BootList, node) {
++        if (pos->type == IPL_TYPE_FLOPPY && pos->drive->floppy_a) {
++            floppy_a = pos;
++            matches++;
++        }
++    }
++    if (matches == 1)
++        map_floppy_drive(floppy_a->drive);
++    else if (matches > 1)
++        dprintf(1, "floppy_a matches multiple drives; using boot order\n");
++
+     // Map drives and populate BEV list
+-    struct bootentry_s *pos;
+     hlist_for_each_entry(pos, &BootList, node) {
+         switch (pos->type) {
+         case IPL_TYPE_BCV:
+@@ -864,8 +882,10 @@ bcv_prepboot(void)
+             add_bev(IPL_TYPE_HARDDISK, 0);
+             break;
+         case IPL_TYPE_FLOPPY:
+-            map_floppy_drive(pos->drive);
+-            add_bev(IPL_TYPE_FLOPPY, 0);
++            if (matches != 1 || pos != floppy_a)
++                map_floppy_drive(pos->drive);
++            add_bev(IPL_TYPE_FLOPPY,
++                    getDriveId(EXTTYPE_FLOPPY, pos->drive));
+             break;
+         case IPL_TYPE_HARDDISK:
+             map_hd_drive(pos->drive);
+@@ -1025,7 +1045,7 @@ do_boot(int seq_nr)
+     switch (ie->type) {
+     case IPL_TYPE_FLOPPY:
+         printf("Booting from Floppy...\n");
+-        boot_disk(0x00, CheckFloppySig);
++        boot_disk(ie->vector, CheckFloppySig);
+         break;
+     case IPL_TYPE_HARDDISK:
+         printf("Booting from Hard Disk...\n");
+diff --git a/src/fw/csm.c b/src/fw/csm.c
+index b632d282..e97a976c 100644
+--- a/src/fw/csm.c
++++ b/src/fw/csm.c
+@@ -72,10 +72,16 @@ csm_return(struct bregs *regs)
+ void
+ csm_romfile_init(void)
+ {
+-    if (!CONFIG_CSM || !csm_compat_table.BootOrderPointer)
++    if (!CONFIG_CSM)
+         return;
+-    char *list = (void *)csm_compat_table.BootOrderPointer;
+-    const_romfile_add("bootorder", list, strlen(list));
++    if (csm_compat_table.BootOrderPointer) {
++        char *list = (void *)csm_compat_table.BootOrderPointer;
++        const_romfile_add("bootorder", list, strlen(list));
++    }
++    if (csm_compat_table.FloppyAPointer) {
++        char *model = (void *)csm_compat_table.FloppyAPointer;
++        const_romfile_add("etc/floppy-a", model, strlen(model));
++    }
+ }
+ 
+ static void
+diff --git a/src/hw/ahci.c b/src/hw/ahci.c
+index 56f10ac1..56133293 100644
+--- a/src/hw/ahci.c
++++ b/src/hw/ahci.c
+@@ -279,7 +279,8 @@ ahci_atapi_issue(struct ahci_port_s *port_gf, struct disk_op_s *op,
+     struct ahci_cmd_s *cmd = port_gf->cmd;
+     scsi_fill_cmd(op, cmd->atapi, CDROM_CDB_SIZE);
+     sata_prep_atapi(&cmd->fis, blocksize);
+-    int rc = ahci_command(port_gf, 0, 1, op->buf_fl, op->count * blocksize);
++    int rc = ahci_command(port_gf, op->command == CMD_WRITE, 1
++                          , op->buf_fl, op->count * blocksize);
+     if (rc < 0)
+         return DISK_RET_EBADTRACK;
+     return DISK_RET_SUCCESS;
+@@ -294,8 +295,11 @@ int ahci_atapi_process_op(struct disk_op_s *op)
+         op->drive_fl, struct ahci_port_s, drive);
+     struct ahci_cmd_s *cmd = port_gf->cmd;
+ 
+-    if (op->command == CMD_WRITE || op->command == CMD_FORMAT)
++    if ((op->command == CMD_WRITE || op->command == CMD_FORMAT)
++        && op->drive_fl->blksize == CDROM_SECTOR_SIZE)
+         return DISK_RET_EWRITEPROTECT;
++    if (op->command == CMD_FORMAT)
++        return DISK_RET_EPARAM;
+     int blocksize = scsi_fill_cmd(op, cmd->atapi, CDROM_CDB_SIZE);
+     if (blocksize < 0)
+         return default_process_op(op);
+@@ -305,7 +309,8 @@ int ahci_atapi_process_op(struct disk_op_s *op)
+         return ahci_atapi_issue(port_gf, op, blocksize);
+ 
+     // CMD_SCSI carries a pre-built CDB we can't safely split.
+-    if (op->command != CMD_READ || blocksize > CDROM_SECTOR_SIZE)
++    if ((op->command != CMD_READ && op->command != CMD_WRITE)
++        || blocksize > CDROM_SECTOR_SIZE)
+         return DISK_RET_EBADTRACK;
+ 
+     // Use a word aligned buffer for AHCI I/O
+@@ -317,10 +322,13 @@ int ahci_atapi_process_op(struct disk_op_s *op)
+ 
+     u16 block;
+     for (block = 0; block < op->count; block++) {
++        if (op->command == CMD_WRITE)
++            memcpy_fl(alignedbuf_fl, position, blocksize);
+         int rc = ahci_atapi_issue(port_gf, &localop, blocksize);
+         if (rc)
+             return rc;
+-        memcpy_fl(position, alignedbuf_fl, blocksize);
++        if (op->command == CMD_READ)
++            memcpy_fl(position, alignedbuf_fl, blocksize);
+         position += blocksize;
+         localop.lba++;
+     }
+@@ -686,15 +694,18 @@ static int ahci_port_setup(struct ahci_port_s *port)
+         port->drive.blksize = CDROM_SECTOR_SIZE;
+         port->drive.sectors = (u64)-1;
+         u8 iscd = ((buffer[0] >> 8) & 0x1f) == 0x05;
+-        if (!iscd) {
+-            dprintf(1, "AHCI/%d: atapi device isn't a cdrom\n", port->pnr);
++        if (!iscd && ((buffer[0] >> 8) & 0x1f) != SCSI_TYPE_DISK) {
++            dprintf(1, "AHCI/%d: unsupported ATAPI device type\n", port->pnr);
+             return -1;
+         }
++        if (!iscd)
++            port->atapi = 2; // Direct-access ATAPI device (ZIP or LS-120).
+         port->desc = znprintf(MAXDESCSIZE
+-                              , "DVD/CD [AHCI/%d: %s ATAPI-%d DVD/CD]"
+-                              , port->pnr
++                              , "%s [AHCI/%d: %s ATAPI-%d%s]"
++                              , iscd ? "DVD/CD" : "ATAPI", port->pnr
+                               , ata_extract_model(model, MAXMODEL, buffer)
+-                              , ata_extract_version(buffer));
++                              , ata_extract_version(buffer)
++                              , iscd ? " DVD/CD" : "");
+         port->prio = bootprio_find_ahci_device(ctrl->pci_tmp, pnr, 1);
+     }
+     boot_lchs_find_ata_device(ctrl->pci_tmp, pnr, 0, &(port->drive.lchs));
+@@ -721,6 +732,8 @@ ahci_port_detect(void *data)
+         if (!port->atapi) {
+             // Register with bcv system.
+             boot_add_hd(&port->drive, port->desc, port->prio);
++        } else if (port->atapi == 2) {
++            atapi_drive_setup(&port->drive, port->desc, port->prio);
+         } else {
+             // fill cdidmap
+             boot_add_cd(&port->drive, port->desc, port->prio);
+diff --git a/src/hw/ata.c b/src/hw/ata.c
+index f788ce71..9ef29d78 100644
+--- a/src/hw/ata.c
++++ b/src/hw/ata.c
+@@ -589,8 +589,11 @@ ata_atapi_process_op(struct disk_op_s *op)
+     if (! CONFIG_ATA)
+         return 0;
+ 
+-    if (op->command == CMD_WRITE || op->command == CMD_FORMAT)
++    if ((op->command == CMD_WRITE || op->command == CMD_FORMAT)
++        && GET_FLATPTR(op->drive_fl->blksize) == CDROM_SECTOR_SIZE)
+         return DISK_RET_EWRITEPROTECT;
++    if (op->command == CMD_FORMAT)
++        return DISK_RET_EPARAM;
+     u8 cdbcmd[CDROM_CDB_SIZE];
+     int blocksize = scsi_fill_cmd(op, cdbcmd, sizeof(cdbcmd));
+     if (blocksize < 0)
+@@ -643,7 +646,7 @@ ata_atapi_process_op(struct disk_op_s *op)
+             goto fail;
+         }
+ 
+-        ret = ata_pio_transfer(op, 0, blocksize);
++        ret = ata_pio_transfer(op, op->command == CMD_WRITE, blocksize);
+     }
+ 
+ fail:
+@@ -743,7 +746,8 @@ init_drive_atapi(struct atadrive_s *dummy, u16 *buffer)
+     u8 iscd = ((buffer[0] >> 8) & 0x1f) == 0x05;
+     char model[MAXMODEL+1];
+     char *desc = znprintf(MAXDESCSIZE
+-                          , "DVD/CD [ata%d-%d: %s ATAPI-%d %s]"
++                          , "%s [ata%d-%d: %s ATAPI-%d %s]"
++                          , iscd ? "DVD/CD" : "ATAPI"
+                           , adrive->chan_gf->ataid, adrive->slave
+                           , ata_extract_model(model, MAXMODEL, buffer)
+                           , ata_extract_version(buffer)
+@@ -760,6 +764,14 @@ init_drive_atapi(struct atadrive_s *dummy, u16 *buffer)
+                                   adrive->slave,
+                                   &(adrive->drive.lchs));
+         boot_add_cd(&adrive->drive, desc, prio);
++    } else if (((buffer[0] >> 8) & 0x1f) == SCSI_TYPE_DISK) {
++        int prio = bootprio_find_ata_device(adrive->chan_gf->pci_tmp,
++                                          adrive->chan_gf->chanid,
++                                          adrive->slave);
++        boot_lchs_find_ata_device(adrive->chan_gf->pci_tmp,
++                                 adrive->chan_gf->chanid,
++                                 adrive->slave, &adrive->drive.lchs);
++        atapi_drive_setup(&adrive->drive, model, prio);
+     }
+ 
+     return adrive;
+diff --git a/src/hw/atapi-floppy.h b/src/hw/atapi-floppy.h
+new file mode 100644
+index 00000000..752deaa2
+--- /dev/null
++++ b/src/hw/atapi-floppy.h
+@@ -0,0 +1,101 @@
++// ATAPI removable-media identification and BIOS geometry.
++// This file may be distributed under the terms of the GNU LGPLv3 license.
++#ifndef __ATAPI_FLOPPY_H
++#define __ATAPI_FLOPPY_H
++
++#include "block.h"
++
++static inline unsigned char
++atapi_model_upper(unsigned char c)
++{
++    return c >= 'a' && c <= 'z' ? c - ('a' - 'A') : c;
++}
++
++static inline int
++atapi_model_matches(const char *model, const char *wanted)
++{
++    if (!*wanted)
++        return 0;
++    for (; *model; model++) {
++        const char *m = model, *w = wanted;
++        while (*m && *w && atapi_model_upper(*m) == atapi_model_upper(*w)) {
++            m++;
++            w++;
++        }
++        if (!*w)
++            return 1;
++    }
++    return 0;
++}
++
++static inline int
++atapi_is_superdisk(const char *model)
++{
++    // Do not classify all removable disks as floppies: ZIP media use an MBR.
++    for (; *model; model++) {
++        const char *p = model;
++        if (atapi_model_upper(*p++) != 'L' || atapi_model_upper(*p++) != 'S')
++            continue;
++        if (*p == '-')
++            p++;
++        if (*p++ != '1' || *p++ != '2' || *p++ != '0')
++            continue;
++        if (*p < '0' || *p > '9')
++            return 1;
++    }
++    return 0;
++}
++
++static inline int
++atapi_floppy_setup(struct drive_s *drive)
++{
++    if (drive->blksize != DISK_SECTOR_SIZE)
++        return -1;
++    drive->lchs.head = 2;
++    drive->lchs.cylinder = 80;
++    switch (drive->sectors) {
++    case 1440:
++        drive->lchs.sector = 9;
++        drive->floppy_type = 3;
++        break;
++    case 2880:
++        drive->lchs.sector = 18;
++        drive->floppy_type = 4;
++        break;
++    case 246528:
++        drive->lchs.head = 8;
++        drive->lchs.cylinder = 963;
++        drive->lchs.sector = 32;
++        drive->floppy_type = 0x10; // ATAPI removable media device.
++        break;
++    default:
++        return -1;
++    }
++    drive->pchs = drive->lchs;
++    return 0;
++}
++
++// Iomega's legacy type-06 ZIP partitions use 64 heads and 32 sectors/track.
++// Retain that BIOS translation rather than the generic 16/63 LBA heuristic.
++static inline int
++atapi_zip_setup(struct drive_s *drive, const char *vendor,
++                const char *product, const char *model)
++{
++    if (drive->blksize != DISK_SECTOR_SIZE || !drive->removable
++        || (drive->lchs.head && drive->lchs.sector))
++        return 0;
++    if (!((atapi_model_matches(vendor, "IOMEGA")
++           && atapi_model_matches(product, "ZIP"))
++          || (atapi_model_matches(model, "IOMEGA")
++              && atapi_model_matches(model, "ZIP"))))
++        return 0;
++    if (drive->sectors != 196608 && drive->sectors != 489532)
++        return 0;
++    drive->lchs.head = 64;
++    drive->lchs.sector = 32;
++    drive->lchs.cylinder = drive->sectors / (64 * 32);
++    drive->pchs = drive->lchs;
++    return 1;
++}
++
++#endif
+diff --git a/src/hw/blockcmd.c b/src/hw/blockcmd.c
+index 426883d3..09825f2b 100644
+--- a/src/hw/blockcmd.c
++++ b/src/hw/blockcmd.c
+@@ -6,6 +6,7 @@
+ // This file may be distributed under the terms of the GNU LGPLv3 license.
+ 
+ #include "block.h" // struct disk_op_s
++#include "atapi-floppy.h" // atapi_floppy_setup
+ #include "blockcmd.h" // struct cdb_request_sense
+ #include "byteorder.h" // be32_to_cpu
+ #include "farptr.h" // GET_FLATPTR
+@@ -14,6 +15,7 @@
+ #include "string.h" // memset
+ #include "util.h" // timer_calc
+ #include "malloc.h"
++#include "romfile.h" // romfile_loadfile
+ 
+ 
+ /****************************************************************
+@@ -354,6 +356,20 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+     if (pdt != SCSI_TYPE_DISK)
+         return -1;
+ 
++    // Some bridges (and emulators) have a generic ATA model but preserve
++    // the drive's identity in INQUIRY.
++    int atapi_floppy = (drive->type == DTYPE_ATA_ATAPI
++                       || drive->type == DTYPE_AHCI_ATAPI)
++        && (drive->floppy_type || atapi_is_superdisk(product));
++    if (atapi_floppy) {
++        drive->floppy_type = 0x10;
++        char *wanted = romfile_loadfile("etc/floppy-a", NULL);
++        drive->floppy_a = wanted && *wanted
++            && (atapi_model_matches(s, wanted)
++                || atapi_model_matches(product, wanted));
++        free(wanted);
++    }
++
+     ret = scsi_is_ready(&dop);
+     if (ret) {
+         dprintf(1, "scsi_is_ready returned %d\n", ret);
+@@ -411,6 +427,24 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+ 
+     char *desc = znprintf(MAXDESCSIZE, "%s Drive %s %s %s"
+                           , s, vendor, product, rev);
+-    boot_add_hd(drive, desc, prio);
++    if (atapi_floppy) {
++        if (atapi_floppy_setup(drive)) {
++            dprintf(1, "%s: unsupported SuperDisk capacity\n", s);
++            return -1;
++        }
++        boot_add_floppy(drive, desc, prio);
++    } else {
++        if (drive->type == DTYPE_ATA_ATAPI || drive->type == DTYPE_AHCI_ATAPI)
++            atapi_zip_setup(drive, vendor, product, s);
++        boot_add_hd(drive, desc, prio);
++    }
+     return 0;
+ }
++
++// IDENTIFY PACKET DEVICE's model survives bridges which change INQUIRY.
++int
++atapi_drive_setup(struct drive_s *drive, const char *model, int prio)
++{
++    drive->floppy_type = atapi_is_superdisk(model) ? 0x10 : 0;
++    return scsi_drive_setup(drive, model, prio);
++}
+diff --git a/src/hw/blockcmd.h b/src/hw/blockcmd.h
+index 2683186c..f4f2bacf 100644
+--- a/src/hw/blockcmd.h
++++ b/src/hw/blockcmd.h
+@@ -133,6 +133,7 @@ int scsi_is_read(struct disk_op_s *op);
+ int scsi_is_ready(struct disk_op_s *op);
+ struct drive_s;
+ int scsi_drive_setup(struct drive_s *drive, const char *s, int prio);
++int atapi_drive_setup(struct drive_s *drive, const char *model, int prio);
+ typedef int (*scsi_add_lun)(u32 lun, struct drive_s *tmpl_drv);
+ int scsi_rep_luns_scan(struct drive_s *tmp_drive, scsi_add_lun add_lun);
+ int scsi_sequential_scan(struct drive_s *tmp_drive, u32 maxluns,
+diff --git a/src/std/LegacyBios.h b/src/std/LegacyBios.h
+index 1719f7ff..bc53e566 100644
+--- a/src/std/LegacyBios.h
++++ b/src/std/LegacyBios.h
+@@ -276,6 +276,8 @@ typedef struct {
+   /// priorities. Zero if the loader does not provide a list.
+   ///
+   UINT32                            BootOrderPointer;
++  // NUL-terminated model substring for the ATAPI floppy reserved as A:.
++  UINT32                            FloppyAPointer;
+ } EFI_COMPATIBILITY16_TABLE;
+ 
+ ///
+diff --git a/tests/README.md b/tests/README.md
+new file mode 100644
+index 00000000..724752c3
+--- /dev/null
++++ b/tests/README.md
+@@ -0,0 +1,81 @@
++ATAPI removable media checks
++===========================
++
++From the repository root, with GCC and its AddressSanitizer/UBSan runtime:
++
++    gcc -Isrc -Wall -Wextra -Werror -fsanitize=address,undefined -g \
++        tests/atapi-floppy.c -o /tmp/seabios-atapi-floppy-test
++    ASAN_OPTIONS=detect_leaks=0 /tmp/seabios-atapi-floppy-test
++
++The test uses the production model matching and geometry helpers. It checks
++LS-120 identification, case-insensitive configuration matching, truncated
++model names, supported floppy capacities, and rejection of ZIP and invalid
++block sizes. It also checks ZIP100/250 legacy 64-head/32-sector translation
++and preservation of geometry supplied by the host. Leak detection is disabled
++because this test allocates nothing
++and LeakSanitizer cannot run in some traced sandboxes.
++
++Build the ReBIOS CSM configuration with GCC, GNU binutils, make and Python 3:
++
++    cp ../ReBIOS/seabios-config .config
++    make olddefconfig
++    make -j4
++
++Real hardware validation is still required for IDE-to-SATA ATAPI bridges
++and the AHCI controller path. Insert the intended medium
++before boot. Switching between 720-KB, 1.44-MB and 120-MB formats at runtime
++is not implemented: the capacity and geometry are recorded during POST.
++Low-level formatting is rejected. ZIP remains a hard disk with its MBR.
++
++DOS BIOS diagnostic
++-------------------
++
++With NASM 2.x, build a DOS diagnostic (no ASPI manager needed):
++
++    nasm -f bin tests/bios-ls120.asm -o /tmp/BIOSTEST.COM
++
++Run BIOSTEST.COM under DOS using disposable test media in BIOS drive 00h.
++It checks geometry and boot-sector reads, then writes/reads the last CHS
++sector and restores its previous contents. It reports success through DOS
++standard output. Use `BIOSTEST > AUX` to capture it through a VM's COM1.
++
++The diagnostic passed with MS-DOS 7.1 booted from an emulated ATAPI LS-120
++with 1.44-MB media in an isolated 86Box fixture. That fixture supplies a
++standalone BIOS platform and the same `etc/floppy-a` ROM file that ReBIOS
++publishes through CSM; it does not run the ReBIOS hypervisor or emulate
++an IDE-to-SATA bridge. Keep those validation scopes distinct.
++
++AHCI ATAPI transport checks
++--------------------------
++
++With Python 3, GCC (or CC=clang), AddressSanitizer and UBSan:
++
++    python3 tests/ahci-atapi.py
++
++This compiles the production CDB builder, ATAPI FIS preparation and AHCI
++ATAPI transfer functions with a mock DMA submission boundary. It verifies
++aligned and odd-address read/write buffers, multi-sector bounce copies,
++write direction, failure propagation, CD write protection, and rejection
++of unaligned pre-built SCSI requests. It does not emulate an AHCI controller
++or qualify a physical SATA bridge.
++
++DOS integration results
++-----------------------
++
++An isolated 86Box PATA fixture booted MS-DOS 7.1 from a 1.44-MB disk in an
++ATAPI LS-120 as A:, then completed an installation through four setup disks,
++including FDISK, reboot, FORMAT, SYS and three media swaps. A native 120-MB
++FAT16 superfloppy also passed BIOS and DOS reads/writes, SYS and boot as A:.
++The installed DOS system used HIMEM/EMM386 for the native-media read/write
++checks; the fixture's KEYB startup line was omitted to isolate storage.
++
++Use BIOS drive 00h in the BPB of a bootable LS-120 superfloppy (for example
++`mkfs.fat -D 0` when preparing the fixture on Linux). Large FAT16 media may
++otherwise default to drive 80h, and DOS SYS preserves that byte.
++
++ATAPI ZIP100 and ZIP250 passed BIOS reads/writes, DOS file copies with and
++without VERIFY, SYS, and DOS 7.1 boot from active type-06 FAT16 partitions
++in MBR slot 4, starting at LBA 32. They remain hard disks. Their legacy CHS
++boot sectors require 64 heads and 32 sectors/track in both the BIOS geometry
++and FAT BPB. Booted file copies matched the original 100,000-byte payload
++by SHA-256, and FAT checks passed after shutdown.
+diff --git a/tests/ahci-atapi.py b/tests/ahci-atapi.py
+new file mode 100644
+index 00000000..84110fb5
+--- /dev/null
++++ b/tests/ahci-atapi.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""Test production ATAPI command/bounce code with a host-side DMA boundary."""
++import os
++from pathlib import Path
++import shlex
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++
++
++def function(path, signature):
++    """Compile the actual functions, leaving hardware initialization outside."""
++    source = (root / path).read_text()
++    start = source.index(signature)
++    brace = source.index("{", start)
++    depth = 1
++    end = brace + 1
++    while depth:
++        depth += (source[end] == "{") - (source[end] == "}")
++        end += 1
++    return source[start:end] + "\n"
++
++
++prefix = r'''
++#include "hw/ahci.h"
++#include "hw/blockcmd.h"
++#include "std/disk.h"
++#undef offsetof
++#define offsetof(t, m) __builtin_offsetof(t, m)
++#define CONFIG_AHCI 1
++#define MODESEGMENT 0
++#define GET_FLATPTR(x) (x)
++#define cpu_to_be16(x) __builtin_bswap16(x)
++#define cpu_to_be32(x) __builtin_bswap32(x)
++#define cpu_to_be64(x) __builtin_bswap64(x)
++#define memset __builtin_memset
++#define memcpy __builtin_memcpy
++#define memset_fl __builtin_memset
++#define memcpy_fl __builtin_memcpy
++#define ATA_CMD_PACKET 0xa0
++#define CDROM_CDB_SIZE 12
++#define CHECK(x) do { if (!(x)) return (__LINE__ % 250) + 1; } while (0)
++static u8 bounce[2048] __attribute__((aligned(2)));
++static u8 bytes[1538] __attribute__((aligned(2)));
++u8 *bounce_buf_fl = bounce;
++static unsigned int calls, bad, fail_on;
++static const u8 *expected;
++int default_process_op(struct disk_op_s *op) { (void)op; return DISK_RET_EPARAM; }
++static int ahci_command(struct ahci_port_s *port, int write, int atapi,
++                        void *buffer, u32 length)
++{
++    struct cdb_rwdata_10 *cdb = (void *)port->cmd->atapi;
++    u32 lba = __builtin_bswap32(cdb->lba);
++    u16 count = __builtin_bswap16(cdb->count);
++    bad |= !atapi || port->cmd->fis.command != ATA_CMD_PACKET;
++    bad |= port->cmd->fis.feature != 1 || length != count * 512;
++    bad |= cdb->command != (write ? CDB_CMD_WRITE_10 : CDB_CMD_READ_10);
++    calls++;
++    if (calls == fail_on)
++        return -1;
++    u8 *data = buffer;
++    u32 i;
++    for (i = 0; i < length; i++) {
++        if (write)
++            bad |= data[i] != expected[(lba - 100) * 512 + i];
++        else
++            data[i] = (u8)(lba + i / 512);
++    }
++    return 0;
++}
++'''
++
++suffix = r'''
++int main(void)
++{
++    struct ahci_cmd_s command = {0};
++    struct ahci_port_s port = {.drive = {.blksize = 512}, .cmd = &command};
++    struct disk_op_s op = {.drive_fl = &port.drive, .lba = 100, .count = 2};
++    unsigned int i, odd;
++    for (odd = 0; odd < 2; odd++) {
++        op.buf_fl = bytes + odd;
++        expected = bytes + odd;
++        for (i = 0; i < 1024; i++)
++            bytes[odd + i] = (u8)(i * 7 + i / 512);
++        calls = bad = fail_on = 0;
++        op.command = CMD_WRITE;
++        CHECK(!ahci_atapi_process_op(&op));
++        CHECK(!bad && calls == (odd ? 2 : 1));
++        calls = bad = 0;
++        op.command = CMD_READ;
++        CHECK(!ahci_atapi_process_op(&op));
++        CHECK(!bad && calls == (odd ? 2 : 1));
++        for (i = 0; i < 1024; i++)
++            CHECK(bytes[odd + i] == 100 + i / 512);
++    }
++    calls = bad = 0;
++    fail_on = 2;
++    op.buf_fl = bytes + 1;
++    op.count = 3;
++    CHECK(ahci_atapi_process_op(&op) == DISK_RET_EBADTRACK);
++    CHECK(!bad && calls == 2);
++    calls = 0;
++    op.command = CMD_FORMAT;
++    CHECK(ahci_atapi_process_op(&op) == DISK_RET_EPARAM);
++    CHECK(!calls);
++    port.drive.blksize = 2048;
++    op.command = CMD_WRITE;
++    CHECK(ahci_atapi_process_op(&op) == DISK_RET_EWRITEPROTECT);
++    CHECK(!calls);
++    op.command = CMD_FORMAT;
++    CHECK(ahci_atapi_process_op(&op) == DISK_RET_EWRITEPROTECT);
++    CHECK(!calls);
++    port.drive.blksize = 512;
++    u8 cdb[16] = {CDB_CMD_INQUIRY};
++    op.command = CMD_SCSI;
++    op.cdbcmd = cdb;
++    op.blocksize = 36;
++    op.count = 1;
++    CHECK(ahci_atapi_process_op(&op) == DISK_RET_EBADTRACK);
++    CHECK(!calls);
++    return 0;
++}
++'''
++
++code = prefix
++code += function("src/hw/blockcmd.c", "int\nscsi_fill_cmd(")
++code += function("src/hw/ahci.c", "static void sata_prep_atapi(")
++code += function("src/hw/ahci.c", "static int\nahci_atapi_issue(")
++code += function("src/hw/ahci.c", "int ahci_atapi_process_op(")
++code += suffix
++with tempfile.TemporaryDirectory(prefix="seabios-ahci-") as tmp:
++    source = Path(tmp) / "test.c"
++    binary = Path(tmp) / "test"
++    source.write_text(code)
++    cc = shlex.split(os.environ.get("CC", "cc"))
++    subprocess.run(cc + ["-Isrc", "-Wall", "-Wextra", "-Werror",
++                        "-Wno-pointer-to-int-cast",
++                        "-fsanitize=address,undefined", "-g", str(source),
++                        "-o", str(binary)], cwd=root, check=True)
++    env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0")
++    subprocess.run([str(binary)], env=env, check=True)
++print("AHCI ATAPI aligned/unaligned reads/writes, errors and CD protection passed")
+diff --git a/tests/atapi-floppy.c b/tests/atapi-floppy.c
+new file mode 100644
+index 00000000..64a7018d
+--- /dev/null
++++ b/tests/atapi-floppy.c
+@@ -0,0 +1,70 @@
++// Host tests of the geometry and model matching used by the ATAPI drivers.
++#include "../src/hw/atapi-floppy.h"
++
++#define CHECK(test) do { if (!(test)) return __LINE__; } while (0)
++
++int main(void)
++{
++    CHECK(atapi_is_superdisk("MATSHITA LS-120 VER5 00"));
++    CHECK(atapi_is_superdisk("LS120 SLIM"));
++    CHECK(atapi_is_superdisk("MATSHITA ls-120 COSM 04"));
++    CHECK(!atapi_is_superdisk("IOMEGA ZIP 100 ATAPI"));
++    CHECK(!atapi_is_superdisk("LS-1200"));
++    CHECK(!atapi_is_superdisk(""));
++    CHECK(!atapi_is_superdisk("L"));
++    CHECK(!atapi_is_superdisk("LS"));
++    CHECK(!atapi_is_superdisk("LS-"));
++    CHECK(!atapi_is_superdisk("LS-1"));
++    CHECK(!atapi_is_superdisk("LS-12"));
++    CHECK(atapi_model_matches("ATAPI [AHCI/1: MATSHITA LS-120]", "ls-120"));
++    CHECK(!atapi_model_matches("IOMEGA ZIP 100", "LS-120"));
++    CHECK(!atapi_model_matches("LS-120", "LS-120 VER5"));
++    CHECK(!atapi_model_matches("LS-120", ""));
++
++    struct drive_s drive = { .blksize = 512 };
++    drive.sectors = 1440;
++    CHECK(!atapi_floppy_setup(&drive));
++    CHECK(drive.floppy_type == 3);
++    CHECK(drive.lchs.head == 2 && drive.lchs.cylinder == 80);
++    CHECK(drive.lchs.sector == 9);
++    drive.sectors = 2880;
++    CHECK(!atapi_floppy_setup(&drive));
++    CHECK(drive.floppy_type == 4 && drive.lchs.sector == 18);
++    drive.sectors = 246528;
++    CHECK(!atapi_floppy_setup(&drive));
++    CHECK(drive.floppy_type == 0x10);
++    CHECK(drive.lchs.head == 8 && drive.lchs.cylinder == 963);
++    CHECK(drive.lchs.sector == 32);
++    CHECK((u64)drive.lchs.head * drive.lchs.cylinder * drive.lchs.sector
++          == drive.sectors);
++    CHECK(drive.pchs.head == drive.lchs.head);
++    CHECK(drive.pchs.cylinder == drive.lchs.cylinder);
++    CHECK(drive.pchs.sector == drive.lchs.sector);
++    drive.sectors = 0;
++    CHECK(atapi_floppy_setup(&drive));
++    drive.sectors = 196608; // ZIP capacity must not become a SuperDisk floppy.
++    CHECK(atapi_floppy_setup(&drive));
++    drive.sectors = 246528;
++    drive.blksize = 2048;
++    CHECK(atapi_floppy_setup(&drive));
++    drive = (struct drive_s){ .blksize = 512, .removable = 1,
++                              .sectors = 196608 };
++    CHECK(atapi_zip_setup(&drive, "IOMEGA", "ZIP 100", "bridge"));
++    CHECK(drive.lchs.head == 64 && drive.lchs.sector == 32);
++    CHECK(drive.lchs.cylinder == 96);
++    drive.lchs = (struct chs_s){0};
++    drive.sectors = 489532;
++    CHECK(atapi_zip_setup(&drive, "bridge", "device", "IOMEGA ZIP 250 ATAPI"));
++    CHECK(drive.lchs.cylinder == 239);
++    drive.lchs = (struct chs_s){ .head = 16, .sector = 63, .cylinder = 485 };
++    CHECK(!atapi_zip_setup(&drive, "IOMEGA", "ZIP 250", "IOMEGA ZIP"));
++    CHECK(drive.lchs.head == 16 && drive.lchs.sector == 63);
++    drive.lchs = (struct chs_s){0};
++    CHECK(!atapi_zip_setup(&drive, "OTHER", "disk", "disk"));
++    drive.sectors = 1000000;
++    CHECK(!atapi_zip_setup(&drive, "IOMEGA", "ZIP 250", "IOMEGA ZIP"));
++    drive.sectors = 196608;
++    drive.removable = 0;
++    CHECK(!atapi_zip_setup(&drive, "IOMEGA", "ZIP 100", "IOMEGA ZIP"));
++    return 0;
++}
+diff --git a/tests/bios-ls120.asm b/tests/bios-ls120.asm
+new file mode 100644
+index 00000000..22031247
+--- /dev/null
++++ b/tests/bios-ls120.asm
+@@ -0,0 +1,81 @@
++; DOS .COM: BIOS A: geometry, boot-sector read, last-sector write/read/restore.
++; Use only with disposable test images. No ASPI or filesystem driver involved.
++bits 16
++org 100h
++start:
++    push ds
++    pop es
++    xor dx,dx
++    mov ah,08h
++    int 13h
++    jc failed
++    or dl,dl
++    jz failed
++    and dx,0ff00h
++    mov [last_cx],cx
++    mov [last_dx],dx
++    mov ax,ds
++    mov es,ax
++    mov bx,saved
++    mov ax,0201h
++    mov cx,1
++    xor dx,dx
++    int 13h
++    jc failed
++    cmp word [saved+510],0aa55h
++    jne failed
++    cmp word [saved+11],512
++    jne failed
++    mov ax,0201h
++    mov bx,saved
++    call last_sector
++    jc failed
++    mov di,pattern
++    mov cx,256
++    mov ax,0a55ah
++    rep stosw
++    mov ax,0301h
++    mov bx,pattern
++    call last_sector
++    jc restore_failed
++    mov ax,0201h
++    mov bx,readback
++    call last_sector
++    jc restore_failed
++    mov si,pattern
++    mov di,readback
++    mov cx,256
++    repe cmpsw
++    jne restore_failed
++    mov ax,0301h
++    mov bx,saved
++    call last_sector
++    jc failed
++    mov dx,passed
++    mov ah,09h
++    int 21h
++    mov ax,4c00h
++    int 21h
++restore_failed:
++    mov ax,0301h
++    mov bx,saved
++    call last_sector
++failed:
++    mov dx,failure
++    mov ah,09h
++    int 21h
++    mov ax,4c01h
++    int 21h
++last_sector:
++    mov cx,[last_cx]
++    mov dx,[last_dx]
++    int 13h
++    ret
++last_cx dw 0
++last_dx dw 0
++passed db 'BIOS LS120 A: read/write/restore passed',13,10,'$'
++failure db 'BIOS LS120 A: FAILED',13,10,'$'
++align 2
++saved times 512 db 0
++pattern times 512 db 0
++readback times 512 db 0

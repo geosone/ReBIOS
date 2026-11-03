@@ -170,6 +170,7 @@ printf '\x07\x00\x00\x00%s' "$(cat rebios.ini)" > /sys/firmware/efi/efivars/ReBI
 | `serial_baud` | int | `115200` | Serial baud rate |
 | `verbose` | bool | `false` | Show debug output on screen while ReBIOS starts |
 | `boot_drive` | `self`/`auto`/drive | `self` | The drive SeaBIOS boots first, the others following in the `auto` order. `self`: the drive ReBIOS was started from, if it has a legacy boot sector. `auto`: drives with something to boot (a legacy boot sector, or a bootable CD or DVD) before those without, internal drives before CDs and DVDs before external (USB) drives, and the drive ReBIOS was started from last; the [ReBIOS USB stick](#the-rebios-usb-stick)'s setting. Anything else names a drive by its UEFI device path (e.g. `PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x1,0xFFFF,0x0)`), or else by part of its model name (e.g. `Samsung SSD 860`), case aside, as ReBIOS lists them when `verbose` is on |
+| `floppy_a` | string | (empty) | Reserve the ATAPI LS-120 whose model contains this text (case-insensitive) as BIOS drive `00h`, DOS A:, independently of boot order and SATA port. Empty uses the normal floppy ordering. The match must identify exactly one ready LS-120. ZIP devices remain hard disks. |
 | `vgabios` | string | *(empty)* | Path to a custom VBIOS file on the partition ReBIOS was started from (e.g. `\EFI\ReBIOS\vgabios.bin`). When empty, the card's built-in OpROM is used, and, failing that, the emulated VGA. If vgabios is set to `cbfs`, vgabios.bin is loaded from coreboot's CBFS. If you set it to `cbfs:filename` you can use a custom CBFS filename |
 | `vga` | PCI address | *(empty)* | PCI address of the VGA card to use (e.g. `00:02.0`). Format: `BB:DD.F` (hex). When empty, the card the firmware displays on is used, or, if it displays on none, the first card with a VBIOS |
 | `vga_emulation` | `auto`/`always`/`never` | `auto` | When to emulate a VGA: when the graphics have no usable Video BIOS (or, without `vgabios`, when the firmware is Apple's, the screen is mounted sideways, or the graphics are in the processor or soldered to the board and came out from 2018 on), always (even if they have one), or never (a Video BIOS then runs in those cases too, and graphics without one get none) |
@@ -208,6 +209,55 @@ cpu_blocklist = 4-6
 ; Boot the drive whose model name has "WDC WD5000" in it first.
 boot_drive = WDC WD5000
 ```
+
+### LS-120 as DOS drive A:
+
+For an IDE/ATAPI LS-120 connected directly or through an ATAPI-capable
+IDE-to-SATA bridge, use:
+
+```ini
+floppy_a = LS-120
+boot_drive = LS-120
+```
+
+`floppy_a` reserves A:; `boot_drive` independently selects what to boot first.
+Omit `boot_drive` to retain the usual boot selection. Use the drive's actual
+model substring (for example `LS120` if its model omits the hyphen). The match
+uses the ATA IDENTIFY model or the SCSI INQUIRY product name; these can
+differ from the UEFI model shown with `verbose`. SeaBIOS logs both identities.
+`boot_drive` can select the device only if UEFI exposes it; otherwise use
+SeaBIOS's boot menu. If multiple ready LS-120 drives match, SeaBIOS reports
+the ambiguity and uses its normal
+floppy order. A ready, supported medium must be inserted before starting
+ReBIOS for the drive to be registered.
+
+The implementation provides BIOS sector reads and writes for 720-KB,
+1.44-MB and 120-MB media, using the appropriate CHS geometry. DOS accesses
+these through INT 13h, without an LS-120-specific DOS driver. The bridge must
+forward ATAPI packet commands; an ATA-only bridge is insufficient. ZIP
+100/250 and other direct-access ATAPI disks use the hard-disk boot path and
+retain their partition table; they are not assigned A: or B:.
+
+This is an initial implementation requiring hardware validation, including
+DOS boot and writes on real LS-120 and ZIP drives. Capacity and geometry are
+captured during POST: changing to a different media capacity after boot and
+low-level formatting are not supported. An OS that takes over the controller
+needs its own driver; the A: mapping describes BIOS/DOS access.
+
+An isolated 86Box PATA test completed a four-disk DOS 7.1 installation via
+LS-120 A:, booted native 120-MB media, and booted ZIP100/250 with BIOS and
+DOS read/write checks. AHCI command construction and bounce-buffer handling
+have host tests; the emulated PATA tests do not validate an AHCI controller,
+a physical bridge, or the complete ReBIOS hypervisor path. See the companion
+test documentation for details. Bootable LS-120 superfloppies need BPB BIOS
+drive 00h (for example, `mkfs.fat -D 0`); DOS SYS preserves this field.
+
+The companion SeaBIOS changes currently live in
+`patches/seabios-atapi-removable.patch`, applied by `./get-deps` after checking
+out the pinned SeaBIOS revision. This patch can be replaced with an updated
+dependency revision once the companion changes are available upstream.
+The geometry/model tests are documented in `seabios/tests/README.md` after
+fetching the dependencies.
 
 ## Frequently Asked Questions
 

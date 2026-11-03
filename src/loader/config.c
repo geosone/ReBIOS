@@ -334,6 +334,18 @@ static bool apply_boot_drive(
     return true;
 }
 
+static bool apply_floppy_a(
+    const struct setting *setting, struct span value
+) {
+    if (value.len >= sizeof(config.floppy_a)) {
+        return false;
+    }
+    memset(config.floppy_a, 0, sizeof(config.floppy_a));
+    memcpy(config.floppy_a, value.ptr, value.len);
+    printf("  %s = %.*s\n", setting->name, (int)value.len, value.ptr);
+    return true;
+}
+
 static bool apply_vga(const struct setting *setting, struct span value) {
     struct handoff_pci_address address;
     if (!parse_pci_address(value, &address)) {
@@ -460,6 +472,7 @@ static const struct setting settings[] = {
     { .name = "serial_baud", .apply = apply_serial_baud },
     { .name = "verbose", .apply = apply_boolean, .flag = &config.verbose },
     { .name = "boot_drive", .apply = apply_boot_drive },
+    { .name = "floppy_a", .apply = apply_floppy_a },
     { .name = "vgabios", .apply = apply_vgabios },
     { .name = "vga", .apply = apply_vga },
     { .name = "vga_emulation", .apply = apply_vga_emulation },
@@ -901,6 +914,7 @@ void config_to_handoff(struct handoff_config *out) {
     out->cpuid_limit = config.cpuid_limit;
     out->igpu_stolen_remap = config.igpu_stolen_remap;
     out->legacy_usb = config.legacy_usb;
+    memcpy(out->floppy_a, config.floppy_a, sizeof(out->floppy_a));
     out->cpu_filter = config.cpu_filter;
     out->cpu_range_count = config.cpu_range_count;
     for (size_t i = 0; i < config.cpu_range_count; i++) {

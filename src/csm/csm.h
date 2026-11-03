@@ -82,6 +82,8 @@ struct csm_compat16_table {
     // bootorder file, which the CSM16 then follows instead of the BBS table's
     // priorities, or 0.
     uint32_t boot_order_pointer;
+    // NUL-terminated model substring to reserve as floppy A:, or 0.
+    uint32_t floppy_a_pointer;
 } __attribute__((packed));
 
 // The size of the specification's table, without SeaBIOS's extension.
@@ -141,7 +143,11 @@ _Static_assert(
     offsetof(struct csm_compat16_table, boot_order_pointer) == 108,
     "CSM16 table layout"
 );
-_Static_assert(sizeof(struct csm_compat16_table) == 112, "CSM16 table layout");
+_Static_assert(
+    offsetof(struct csm_compat16_table, floppy_a_pointer) == 112,
+    "CSM16 table layout"
+);
+_Static_assert(sizeof(struct csm_compat16_table) == 116, "CSM16 table layout");
 
 // EFI_COMPATIBILITY_FUNCTIONS, which the CSM16 takes in AX.
 #define CSM_COMPAT16_INITIALIZE_YOURSELF 0x0000
