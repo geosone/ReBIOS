@@ -387,6 +387,17 @@ static bool apply_vga_emulation(
     return true;
 }
 
+// In the order of the HANDOFF_ZIP_MODE_* values.
+static const char *const zip_mode_names[] = { "auto", "floppy", "hdd" };
+
+static bool apply_zip_mode(const struct setting *setting, struct span value) {
+    if (!apply_choice(value, zip_mode_names, 3, &config.zip_mode)) {
+        return false;
+    }
+    printf("  %s = %s\n", setting->name, zip_mode_names[config.zip_mode]);
+    return true;
+}
+
 // In the order of the HANDOFF_VGA_SCALING_* values.
 static const char *const vga_scaling_names[] = {
     "stretch", "aspect", "center", "manual", "integer"
@@ -473,6 +484,7 @@ static const struct setting settings[] = {
     { .name = "verbose", .apply = apply_boolean, .flag = &config.verbose },
     { .name = "boot_drive", .apply = apply_boot_drive },
     { .name = "floppy_a", .apply = apply_floppy_a },
+    { .name = "zip_mode", .apply = apply_zip_mode },
     { .name = "vgabios", .apply = apply_vgabios },
     { .name = "vga", .apply = apply_vga },
     { .name = "vga_emulation", .apply = apply_vga_emulation },
@@ -876,6 +888,7 @@ void config_load(void) {
     config.serial_port = 0x3f8;
     config.serial_baud = 115200;
     config.vga_emulation = HANDOFF_VGA_EMULATION_AUTO;
+    config.zip_mode = HANDOFF_ZIP_MODE_AUTO;
     config.vga_scaling = HANDOFF_VGA_SCALING_STRETCH;
     config.vga_scale = 1;
     config.avic = HANDOFF_AVIC_AUTO;
@@ -915,6 +928,7 @@ void config_to_handoff(struct handoff_config *out) {
     out->igpu_stolen_remap = config.igpu_stolen_remap;
     out->legacy_usb = config.legacy_usb;
     memcpy(out->floppy_a, config.floppy_a, sizeof(out->floppy_a));
+    out->zip_mode = config.zip_mode;
     out->cpu_filter = config.cpu_filter;
     out->cpu_range_count = config.cpu_range_count;
     for (size_t i = 0; i < config.cpu_range_count; i++) {

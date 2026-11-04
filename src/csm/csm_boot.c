@@ -575,11 +575,15 @@ void csm_boot_start(struct vcpu *v) {
             "The legacy BIOS takes no boot order, ordering by controller\n"
         );
     }
-    if (csm.compat16->table_length >= sizeof(struct csm_compat16_table)
+    if (csm.compat16->table_length
+         >= offsetof(struct csm_compat16_table, zip_mode)
      && core_handoff->config.floppy_a[0] != 0) {
         memcpy(layout_low(FLOPPY_A), core_handoff->config.floppy_a,
                HANDOFF_FLOPPY_MODEL_MAX);
         csm.compat16->floppy_a_pointer = FLOPPY_A;
+    }
+    if (csm.compat16->table_length >= sizeof(struct csm_compat16_table)) {
+        csm.compat16->zip_mode = core_handoff->config.zip_mode + 1;
     }
     bool rsdp_failed = acpi
         && !csm_copy_rsdp(

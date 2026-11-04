@@ -170,7 +170,8 @@ printf '\x07\x00\x00\x00%s' "$(cat rebios.ini)" > /sys/firmware/efi/efivars/ReBI
 | `serial_baud` | int | `115200` | Serial baud rate |
 | `verbose` | bool | `false` | Show debug output on screen while ReBIOS starts |
 | `boot_drive` | `self`/`auto`/drive | `self` | The drive SeaBIOS boots first, the others following in the `auto` order. `self`: the drive ReBIOS was started from, if it has a legacy boot sector. `auto`: drives with something to boot (a legacy boot sector, or a bootable CD or DVD) before those without, internal drives before CDs and DVDs before external (USB) drives, and the drive ReBIOS was started from last; the [ReBIOS USB stick](#the-rebios-usb-stick)'s setting. Anything else names a drive by its UEFI device path (e.g. `PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x1,0xFFFF,0x0)`), or else by part of its model name (e.g. `Samsung SSD 860`), case aside, as ReBIOS lists them when `verbose` is on |
-| `floppy_a` | string | (empty) | Reserve the ATAPI LS-120 whose model contains this text (case-insensitive) as BIOS drive `00h`, DOS A:, independently of boot order and SATA port. Empty uses the normal floppy ordering. The match must identify exactly one LS-120, with or without media. ZIP devices remain hard disks. |
+| `floppy_a` | string | (empty) | Reserve the ATAPI LS-120 whose model contains this text (case-insensitive) as BIOS drive `00h`, DOS A:, independently of boot order and SATA port. Empty uses the normal floppy ordering. The match must identify exactly one LS-120, with or without media. |
+| `zip_mode` | `auto`/`floppy`/`hdd` | `auto` | How an ATAPI Iomega ZIP drive is mapped, until the next boot: by its media when ReBIOS starts (a partition table makes it a hard disk; media without one, or no media, a floppy drive, B: next to an LS-120 on A:), always as a floppy drive, or always as a hard disk (as before, then only with media inserted) |
 | `vgabios` | string | *(empty)* | Path to a custom VBIOS file on the partition ReBIOS was started from (e.g. `\EFI\ReBIOS\vgabios.bin`). When empty, the card's built-in OpROM is used, and, failing that, the emulated VGA. If vgabios is set to `cbfs`, vgabios.bin is loaded from coreboot's CBFS. If you set it to `cbfs:filename` you can use a custom CBFS filename |
 | `vga` | PCI address | *(empty)* | PCI address of the VGA card to use (e.g. `00:02.0`). Format: `BB:DD.F` (hex). When empty, the card the firmware displays on is used, or, if it displays on none, the first card with a VBIOS |
 | `vga_emulation` | `auto`/`always`/`never` | `auto` | When to emulate a VGA: when the graphics have no usable Video BIOS (or, without `vgabios`, when the firmware is Apple's, the screen is mounted sideways, or the graphics are in the processor or soldered to the board and came out from 2018 on), always (even if they have one), or never (a Video BIOS then runs in those cases too, and graphics without one get none) |
@@ -238,7 +239,17 @@ The implementation provides BIOS sector reads and writes for 720-KB,
 1.44-MB and 120-MB media, using the appropriate CHS geometry, and for other
 media whose geometry the drive reports (its Flexible Disk mode page).
 LS-120 and LS-240 models, and models with "Floppy" in their name, are
-recognized; so is any drive `floppy_a` names. DOS accesses
+recognized; so is any drive `floppy_a` names.
+
+A ZIP drive is a hard disk or a floppy drive as `zip_mode` says. In `auto`
+mode, as the "auto" ZIP emulation of old BIOSes did, partitioned media
+(in any of the four MBR entries) at boot make it a hard disk, and
+superfloppy media (formatted without a partition table, e.g. by DOS FORMAT
+in the floppy drive) or none a floppy drive. The mapping stays until the
+next boot: a floppy-mapped ZIP reads superfloppies inserted or changed
+later, not partitioned media. Floppy-mapped drives also answer the EDD
+functions (INT 13h AH=41h-48h), through which DOS drivers such as
+OpenASPI's ASPIFDD find them and take their letter over. DOS accesses
 these through INT 13h, without an LS-120-specific DOS driver. The bridge must
 forward ATAPI packet commands; an ATA-only bridge is insufficient. ZIP
 100/250 and other direct-access ATAPI disks use the hard-disk boot path and
@@ -253,7 +264,9 @@ An isolated 86Box PATA test completed a four-disk DOS 7.1 installation via
 LS-120 A:, booted native 120-MB media, and booted ZIP100/250 with BIOS and
 DOS read/write checks. Another booted DOS 7.1 (with EMM386) from the hard
 disk with the LS-120 empty, then read a 1.44-MB disk inserted afterwards and
-a 120-MB disk swapped in for it. AHCI command construction and bounce-buffer handling
+a 120-MB disk swapped in for it. With a ZIP 100 beside the LS-120, partitioned
+ZIP media at boot became hard disk D:, a superfloppy at boot or inserted
+into an empty ZIP became B:. AHCI command construction and bounce-buffer handling
 have host tests; the emulated PATA tests do not validate an AHCI controller,
 a physical bridge, or the complete ReBIOS hypervisor path. See the companion
 test documentation for details. Bootable LS-120 superfloppies need BPB BIOS

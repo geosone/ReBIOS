@@ -86,7 +86,7 @@ index fb494577..0dd4c540 100644
      case IPL_TYPE_HARDDISK:
          printf("Booting from Hard Disk...\n");
 diff --git a/src/disk.c b/src/disk.c
-index 0328fbd1..7d5f199d 100644
+index 0328fbd1..e099e0b6 100644
 --- a/src/disk.c
 +++ b/src/disk.c
 @@ -9,6 +9,8 @@
@@ -137,7 +137,27 @@ index 0328fbd1..7d5f199d 100644
  // Execute a "disk_op_s" request after jumping to the extra stack.
  static int
  __send_disk_op(struct disk_op_s *op_far, u16 op_seg)
-@@ -280,12 +308,15 @@ disk_1308(struct bregs *regs, struct drive_s *drive_fl)
+@@ -168,7 +196,18 @@ extended_access(struct bregs *regs, struct drive_s *drive_fl, u16 command)
+     dop.lba = GET_FARVAR(regs->ds, param_far->lba);
+     dop.command = command;
+     dop.drive_fl = drive_fl;
+-    if (dop.lba >= GET_FLATPTR(drive_fl->sectors)) {
++    u64 sectors = GET_FLATPTR(drive_fl->sectors);
++    struct atapi_media_s *media_fl = GET_FLATPTR(drive_fl->media);
++    if (media_fl) {
++        // An ATAPI floppy: the media now in the drive.
++        int ret = media_check(drive_fl);
++        if (ret) {
++            disk_ret(regs, ret);
++            return;
++        }
++        sectors = GET_FLATPTR(media_fl->sectors);
++    }
++    if (dop.lba >= sectors) {
+         warn_invalid(regs);
+         disk_ret(regs, DISK_RET_EPARAM);
+         return;
+@@ -280,12 +319,15 @@ disk_1308(struct bregs *regs, struct drive_s *drive_fl)
      nlc--;
      nlh--;
      u8 count;
@@ -153,7 +173,7 @@ index 0328fbd1..7d5f199d 100644
          else
              regs->bx = GET_FLATPTR(drive_fl->floppy_type);
  
-@@ -655,9 +686,54 @@ disk_13(struct bregs *regs, struct drive_s *drive_fl)
+@@ -655,9 +697,61 @@ disk_13(struct bregs *regs, struct drive_s *drive_fl)
      }
  }
  
@@ -205,14 +225,21 @@ index 0328fbd1..7d5f199d 100644
 +    if (GET_FLATPTR(drive_fl->media) && atapi_floppy_13(regs, drive_fl))
 +        return;
 +
++    // A disk mapped as a floppy drive (the LS-120 as A:) keeps the disk
++    // services, EDD included: DOS drivers find the device by its path.
++    if (GET_FLATPTR(drive_fl->type) != DTYPE_FLOPPY) {
++        disk_13(regs, drive_fl);
++        return;
++    }
++
      // Only limited commands are supported on floppies.
      switch (regs->ah) {
      case 0x00:
 diff --git a/src/fw/csm.c b/src/fw/csm.c
-index b632d282..e97a976c 100644
+index b632d282..2a476761 100644
 --- a/src/fw/csm.c
 +++ b/src/fw/csm.c
-@@ -72,10 +72,16 @@ csm_return(struct bregs *regs)
+@@ -72,10 +72,19 @@ csm_return(struct bregs *regs)
  void
  csm_romfile_init(void)
  {
@@ -229,6 +256,9 @@ index b632d282..e97a976c 100644
 +        char *model = (void *)csm_compat_table.FloppyAPointer;
 +        const_romfile_add("etc/floppy-a", model, strlen(model));
 +    }
++    if (csm_compat_table.ZipMode)
++        const_romfile_add("etc/zip-mode", &csm_compat_table.ZipMode,
++                          sizeof(csm_compat_table.ZipMode));
  }
  
  static void
@@ -370,10 +400,10 @@ index f788ce71..9ef29d78 100644
      return adrive;
 diff --git a/src/hw/atapi-floppy.h b/src/hw/atapi-floppy.h
 new file mode 100644
-index 00000000..1f3584e2
+index 00000000..39e07e68
 --- /dev/null
 +++ b/src/hw/atapi-floppy.h
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,228 @@
 +// ATAPI removable-media identification and BIOS geometry.
 +// This file may be distributed under the terms of the GNU LGPLv3 license.
 +#ifndef __ATAPI_FLOPPY_H
@@ -434,6 +464,47 @@ index 00000000..1f3584e2
 +    if (atapi_model_matches(model, "ZIP"))
 +        return 0;
 +    return atapi_is_ls_model(model) || atapi_model_matches(model, "FLOPPY");
++}
++
++static inline int
++atapi_is_zip(const char *vendor, const char *product, const char *model)
++{
++    return (atapi_model_matches(vendor, "IOMEGA")
++            && atapi_model_matches(product, "ZIP"))
++        || (atapi_model_matches(model, "IOMEGA")
++            && atapi_model_matches(model, "ZIP"));
++}
++
++// How a ZIP drive is mapped (the etc/zip-mode ROM file, as ReBIOS's
++// zip_mode setting gives it): by its media at POST, or always as a floppy
++// or a hard disk. As old BIOSes did, the mapping stays until the next boot.
++#define ATAPI_ZIP_AUTO   1 // Partitioned media: hard disk; else a floppy.
++#define ATAPI_ZIP_FLOPPY 2
++#define ATAPI_ZIP_HDD    3
++
++// Whether sector 0 holds a partition table (hard-disk media) rather than a
++// FAT boot sector (superfloppy media) or nothing.
++static inline int
++atapi_media_has_mbr(const u8 *sector)
++{
++    if (sector[510] != 0x55 || sector[511] != 0xaa)
++        return 0;
++    // A FAT boot sector: a jump, 512 bytes per sector, a power-of-two
++    // cluster size and one or two FATs.
++    u8 spc = sector[13], fats = sector[16];
++    if ((sector[0] == 0xeb || sector[0] == 0xe9)
++        && sector[11] == 0x00 && sector[12] == 0x02
++        && spc && !(spc & (spc - 1)) && (fats == 1 || fats == 2))
++        return 0;
++    int i, found = 0;
++    for (i = 0; i < 4; i++) {
++        const u8 *entry = sector + 446 + 16 * i;
++        if (entry[0] != 0x00 && entry[0] != 0x80)
++            return 0;
++        if (entry[4])
++            found = 1;
++    }
++    return found;
 +}
 +
 +// INT 13h drive type of an ATAPI removable media device (ARMD).
@@ -500,6 +571,23 @@ index 00000000..1f3584e2
 +    return 0;
 +}
 +
++// Geometry for other media (ZIP superfloppies, which have no Flexible Disk
++// page): the 64-head/32-sector translation of Iomega's BIOS. Media beyond
++// 1024 cylinders is not supported.
++static inline int
++atapi_floppy_large_geometry(u32 sectors, struct chs_s *chs, u8 *type)
++{
++    u32 cylinders = sectors / (64 * 32);
++    if (!cylinders || cylinders > 1024)
++        return -1;
++    chs->head = 64;
++    chs->sector = 32;
++    chs->cylinder = cylinders;
++    chs->pad = 0;
++    *type = ATAPI_FLOPPY_TYPE_ARMD;
++    return 0;
++}
++
 +// The geometry INT 13h reports without media: a 1.44-MB drive of the ARMD
 +// type, as the ARMD specification's AH=08h does.
 +static inline void
@@ -532,10 +620,7 @@ index 00000000..1f3584e2
 +    if (drive->blksize != DISK_SECTOR_SIZE || !drive->removable
 +        || (drive->lchs.head && drive->lchs.sector))
 +        return 0;
-+    if (!((atapi_model_matches(vendor, "IOMEGA")
-+           && atapi_model_matches(product, "ZIP"))
-+          || (atapi_model_matches(model, "IOMEGA")
-+              && atapi_model_matches(model, "ZIP"))))
++    if (!atapi_is_zip(vendor, product, model))
 +        return 0;
 +    if (drive->sectors != 196608 && drive->sectors != 489532)
 +        return 0;
@@ -548,7 +633,7 @@ index 00000000..1f3584e2
 +
 +#endif
 diff --git a/src/hw/blockcmd.c b/src/hw/blockcmd.c
-index 426883d3..e2461fa7 100644
+index 426883d3..04943bea 100644
 --- a/src/hw/blockcmd.c
 +++ b/src/hw/blockcmd.c
 @@ -6,6 +6,7 @@
@@ -568,7 +653,7 @@ index 426883d3..e2461fa7 100644
  
  
  /****************************************************************
-@@ -117,6 +120,166 @@ cdb_mode_sense_geom(struct disk_op_s *op, struct cdbres_mode_sense_geom *data)
+@@ -117,6 +120,167 @@ cdb_mode_sense_geom(struct disk_op_s *op, struct cdbres_mode_sense_geom *data)
  }
  
  
@@ -637,10 +722,11 @@ index 426883d3..e2461fa7 100644
 +        struct atapi_mode_flexible page __aligned(4);
 +        memset(&page, 0, sizeof(page));
 +        ret = atapi_media_cdb(drive_fl, &ms, &page, sizeof(page));
-+        if (ret || (page.page_code & 0x3f) != 0x05
-+            || atapi_floppy_page_geometry(sectors, page.heads, page.sectors
-+                                          , be16_to_cpu(page.cylinders)
-+                                          , &chs, &type)) {
++        if ((ret || (page.page_code & 0x3f) != 0x05
++             || atapi_floppy_page_geometry(sectors, page.heads, page.sectors
++                                           , be16_to_cpu(page.cylinders)
++                                           , &chs, &type))
++            && atapi_floppy_large_geometry(sectors, &chs, &type)) {
 +            dprintf(1, "ATAPI floppy: no geometry for %u sectors\n", sectors);
 +            SET_FLATPTR(media_fl->state, ATAPI_MEDIA_UNSUPPORTED);
 +            return DISK_RET_EBADTRACK;
@@ -735,7 +821,7 @@ index 426883d3..e2461fa7 100644
  /****************************************************************
   * Main SCSI commands
   ****************************************************************/
-@@ -146,9 +309,12 @@ scsi_fill_cmd(struct disk_op_s *op, void *cdbcmd, int maxcdb)
+@@ -146,9 +310,12 @@ scsi_fill_cmd(struct disk_op_s *op, void *cdbcmd, int maxcdb)
          }
          return GET_FLATPTR(op->drive_fl->blksize);
      case CMD_SCSI:
@@ -750,7 +836,7 @@ index 426883d3..e2461fa7 100644
          return op->blocksize;
      default:
          return -1;
-@@ -160,7 +326,7 @@ int
+@@ -160,7 +327,7 @@ int
  scsi_is_read(struct disk_op_s *op)
  {
      return op->command == CMD_READ || (
@@ -759,7 +845,32 @@ index 426883d3..e2461fa7 100644
  }
  
  // Check if a SCSI device is ready to receive commands
-@@ -354,7 +520,48 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+@@ -314,6 +481,24 @@ int scsi_sequential_scan(struct drive_s *tmp_drive, u32 maxluns,
+     return ret;
+ }
+ 
++// Whether the media's sector 0 has a partition table (a ZIP auto mode).
++static int
++atapi_zip_partitioned(struct disk_op_s *dop)
++{
++    u8 *buf = malloc_tmp(DISK_SECTOR_SIZE);
++    if (!buf) {
++        warn_noalloc();
++        return 0;
++    }
++    dop->command = CMD_READ;
++    dop->lba = 0;
++    dop->count = 1;
++    dop->buf_fl = buf;
++    int has_mbr = !process_op(dop) && atapi_media_has_mbr(buf);
++    free(buf);
++    return has_mbr;
++}
++
+ // Validate drive, find block size / sector count, and register drive.
+ int
+ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+@@ -354,7 +539,55 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
      if (pdt != SCSI_TYPE_DISK)
          return -1;
  
@@ -775,10 +886,17 @@ index 426883d3..e2461fa7 100644
 +                || atapi_model_matches(product, wanted));
 +        free(wanted);
 +    }
++    // A ZIP is a floppy or a hard disk as etc/zip-mode says; in auto mode
++    // (the default) by its media below.
++    int zip = is_atapi && !floppy_a && atapi_is_zip(vendor, product, s);
++    int zip_mode = zip ? romfile_loadint("etc/zip-mode", ATAPI_ZIP_AUTO) : 0;
++    if (zip)
++        dprintf(1, "%s: ZIP mode %d\n", s, zip_mode);
 +    // The drive named by floppy_a is a floppy even if its model does not
 +    // say so.
 +    int atapi_floppy = is_atapi
-+        && (drive->floppy_type || atapi_is_superdisk(product) || floppy_a);
++        && (drive->floppy_type || atapi_is_superdisk(product) || floppy_a
++            || (zip && zip_mode != ATAPI_ZIP_HDD));
 +    if (atapi_floppy) {
 +        drive->floppy_type = ATAPI_FLOPPY_TYPE_ARMD;
 +        drive->floppy_a = floppy_a;
@@ -808,8 +926,19 @@ index 426883d3..e2461fa7 100644
      if (ret) {
          dprintf(1, "scsi_is_ready returned %d\n", ret);
          return ret;
-@@ -411,6 +618,34 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+@@ -409,8 +642,45 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+         }
+     }
  
++    if (atapi_floppy && zip && zip_mode == ATAPI_ZIP_AUTO
++        && atapi_zip_partitioned(&dop)) {
++        dprintf(1, "%s: partitioned ZIP media, mapped as a hard disk\n", s);
++        free(drive->media);
++        drive->media = NULL;
++        drive->floppy_type = 0;
++        atapi_floppy = 0;
++    }
++
      char *desc = znprintf(MAXDESCSIZE, "%s Drive %s %s %s"
                            , s, vendor, product, rev);
 -    boot_add_hd(drive, desc, prio);
@@ -858,24 +987,26 @@ index 2683186c..50e83e8e 100644
  int scsi_rep_luns_scan(struct drive_s *tmp_drive, scsi_add_lun add_lun);
  int scsi_sequential_scan(struct drive_s *tmp_drive, u32 maxluns,
 diff --git a/src/std/LegacyBios.h b/src/std/LegacyBios.h
-index 1719f7ff..bc53e566 100644
+index 1719f7ff..3f6adefa 100644
 --- a/src/std/LegacyBios.h
 +++ b/src/std/LegacyBios.h
-@@ -276,6 +276,8 @@ typedef struct {
+@@ -276,6 +276,10 @@ typedef struct {
    /// priorities. Zero if the loader does not provide a list.
    ///
    UINT32                            BootOrderPointer;
 +  // NUL-terminated model substring for the ATAPI floppy reserved as A:.
 +  UINT32                            FloppyAPointer;
++  // How an ATAPI ZIP drive is mapped: 0 unset, 1 auto, 2 floppy, 3 hard disk.
++  UINT32                            ZipMode;
  } EFI_COMPATIBILITY16_TABLE;
  
  ///
 diff --git a/tests/README.md b/tests/README.md
 new file mode 100644
-index 00000000..fd8b8b97
+index 00000000..58d8b563
 --- /dev/null
 +++ b/tests/README.md
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,109 @@
 +ATAPI removable media checks
 +===========================
 +
@@ -900,8 +1031,15 @@ index 00000000..fd8b8b97
 +    make -j4
 +
 +Real hardware validation is still required for IDE-to-SATA ATAPI bridges
-+and the AHCI controller path. Low-level formatting is rejected. ZIP remains a
-+hard disk with its MBR.
++and the AHCI controller path. Low-level formatting is rejected.
++
++A ZIP is mapped as the `etc/zip-mode` ROM file says (ReBIOS's `zip_mode`):
++in auto mode (the default) by its media at POST, a hard disk when sector 0
++has a partition table (in any of its four entries), else a floppy, also
++without media; or always as a floppy (2) or a hard disk (3). As with old
++BIOSes, the mapping stays until the next boot. A ZIP floppy handles media
++changes as the LS-120 does, with the 64-head/32-sector geometry of
++Iomega's BIOS translation.
 +
 +An LS-120 is registered as a floppy drive with or without media at POST.
 +As the ATAPI Removable Media Device BIOS Specification describes, INT 13h
@@ -964,6 +1102,13 @@ index 00000000..fd8b8b97
 +Use BIOS drive 00h in the BPB of a bootable LS-120 superfloppy (for example
 +`mkfs.fat -D 0` when preparing the fixture on Linux). Large FAT16 media may
 +otherwise default to drive 80h, and DOS SYS preserves that byte.
++
++With an LS-120 (empty, A:) and a ZIP 100 on one IDE channel, booted from
++the hard disk: partitioned ZIP media at boot (partition in slot 4 or slot 1)
++became hard disk D:; a superfloppy at boot became B:; an empty ZIP became B:
++and a superfloppy inserted afterwards was listed and read through B:. Forced
++floppy mode kept partitioned media off D:; forced hard-disk mode registered
++no drive without media.
 +
 +ATAPI ZIP100 and ZIP250 passed BIOS reads/writes, DOS file copies with and
 +without VERIFY, SYS, and DOS 7.1 boot from active type-06 FAT16 partitions
@@ -1124,10 +1269,10 @@ index 00000000..7774304e
 +print("AHCI ATAPI aligned/unaligned reads/writes, errors and CD protection passed")
 diff --git a/tests/atapi-floppy.c b/tests/atapi-floppy.c
 new file mode 100644
-index 00000000..1ea626ed
+index 00000000..51ba8c52
 --- /dev/null
 +++ b/tests/atapi-floppy.c
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,129 @@
 +// Host tests of the geometry and model matching used by the ATAPI drivers.
 +#include "../src/hw/atapi-floppy.h"
 +
@@ -1167,6 +1312,38 @@ index 00000000..1ea626ed
 +    CHECK(atapi_floppy_page_geometry(469505, 32, 56, 262, &chs, &type));
 +    CHECK(atapi_floppy_page_geometry(64 * 2 * 1100, 2, 64, 1100, &chs, &type));
 +    CHECK(atapi_floppy_page_geometry(0, 0, 0, 0, &chs, &type));
++    CHECK(!atapi_floppy_large_geometry(196608, &chs, &type)); // ZIP 100
++    CHECK(chs.cylinder == 96 && chs.head == 64 && chs.sector == 32);
++    CHECK(!atapi_floppy_large_geometry(489532, &chs, &type)); // ZIP 250
++    CHECK(chs.cylinder == 239 && type == ATAPI_FLOPPY_TYPE_ARMD);
++    CHECK(atapi_floppy_large_geometry(2047, &chs, &type));
++    CHECK(atapi_floppy_large_geometry(1025 * 2048, &chs, &type));
++
++    CHECK(atapi_is_zip("IOMEGA", "ZIP 100", "bridge"));
++    CHECK(atapi_is_zip("ATA", "disk", "IOMEGA ZIP 250 ATAPI"));
++    CHECK(!atapi_is_zip("MATSHITA", "LS-120 COSM 04", "LS-120"));
++
++    static u8 sector[512];
++    CHECK(!atapi_media_has_mbr(sector));
++    sector[510] = 0x55;
++    sector[511] = 0xaa;
++    CHECK(!atapi_media_has_mbr(sector)); // No partition.
++    sector[446 + 3 * 16 + 4] = 0x06;     // Iomega's partition 4, FAT16.
++    CHECK(atapi_media_has_mbr(sector));
++    sector[446] = 0x12;                  // Not a status byte.
++    CHECK(!atapi_media_has_mbr(sector));
++    sector[446] = 0x80;
++    CHECK(atapi_media_has_mbr(sector));
++    // A FAT boot sector (superfloppy) whose BPB bytes look like entries.
++    sector[0] = 0xeb;
++    sector[11] = 0x00;
++    sector[12] = 0x02;
++    sector[13] = 32;
++    sector[16] = 2;
++    CHECK(!atapi_media_has_mbr(sector));
++    sector[13] = 3;                      // Not a cluster size: an MBR.
++    CHECK(atapi_media_has_mbr(sector));
++
 +    struct atapi_media_s media = { .state = ATAPI_MEDIA_READY };
 +    atapi_media_none(&media);
 +    CHECK(media.state == ATAPI_MEDIA_NONE && media.sectors == 0);

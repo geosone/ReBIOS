@@ -127,6 +127,10 @@ struct handoff_block_device {
 #define HANDOFF_VGA_EMULATION_ALWAYS 1
 #define HANDOFF_VGA_EMULATION_NEVER 2
 
+#define HANDOFF_ZIP_MODE_AUTO 0
+#define HANDOFF_ZIP_MODE_FLOPPY 1
+#define HANDOFF_ZIP_MODE_HDD 2
+
 // How an emulated VGA's display fills the framebuffer: all of it, as much of
 // it as 4:3 allows, at one framebuffer pixel per VGA pixel, at vga_scale
 // pixels per pixel, or at the most whole pixels per pixel that fit; centered
@@ -170,6 +174,9 @@ struct handoff_config {
     uint8_t legacy_usb;
     // Model substring of an ATAPI LS-120 to reserve as BIOS drive 00h.
     char floppy_a[HANDOFF_FLOPPY_MODEL_MAX];
+    // How an ATAPI ZIP drive is mapped: by its media at boot (partitioned:
+    // hard disk, else floppy), or always as a floppy or a hard disk.
+    uint8_t zip_mode;
     // Which APIC IDs the guest gets, as inclusive ranges.
     uint32_t cpu_filter;
     uint32_t cpu_range_count;
