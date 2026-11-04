@@ -51,6 +51,7 @@ struct config {
     // model; empty when unset, which is "self".
     char boot_drive[CONFIG_BOOT_DRIVE_MAX];
     char floppy_a[HANDOFF_FLOPPY_MODEL_MAX];
+    char floppy_b[HANDOFF_FLOPPY_MODEL_MAX];
     // One of the HANDOFF_ZIP_MODE_* values.
     uint8_t zip_mode;
     // One of the HANDOFF_CPU_FILTER_* values.

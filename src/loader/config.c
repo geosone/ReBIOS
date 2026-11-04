@@ -334,16 +334,28 @@ static bool apply_boot_drive(
     return true;
 }
 
+static bool apply_floppy(
+    const struct setting *setting, struct span value, char *out
+) {
+    if (value.len >= HANDOFF_FLOPPY_MODEL_MAX) {
+        return false;
+    }
+    memset(out, 0, HANDOFF_FLOPPY_MODEL_MAX);
+    memcpy(out, value.ptr, value.len);
+    printf("  %s = %.*s\n", setting->name, (int)value.len, value.ptr);
+    return true;
+}
+
 static bool apply_floppy_a(
     const struct setting *setting, struct span value
 ) {
-    if (value.len >= sizeof(config.floppy_a)) {
-        return false;
-    }
-    memset(config.floppy_a, 0, sizeof(config.floppy_a));
-    memcpy(config.floppy_a, value.ptr, value.len);
-    printf("  %s = %.*s\n", setting->name, (int)value.len, value.ptr);
-    return true;
+    return apply_floppy(setting, value, config.floppy_a);
+}
+
+static bool apply_floppy_b(
+    const struct setting *setting, struct span value
+) {
+    return apply_floppy(setting, value, config.floppy_b);
 }
 
 static bool apply_vga(const struct setting *setting, struct span value) {
@@ -484,6 +496,7 @@ static const struct setting settings[] = {
     { .name = "verbose", .apply = apply_boolean, .flag = &config.verbose },
     { .name = "boot_drive", .apply = apply_boot_drive },
     { .name = "floppy_a", .apply = apply_floppy_a },
+    { .name = "floppy_b", .apply = apply_floppy_b },
     { .name = "zip_mode", .apply = apply_zip_mode },
     { .name = "vgabios", .apply = apply_vgabios },
     { .name = "vga", .apply = apply_vga },
@@ -928,6 +941,7 @@ void config_to_handoff(struct handoff_config *out) {
     out->igpu_stolen_remap = config.igpu_stolen_remap;
     out->legacy_usb = config.legacy_usb;
     memcpy(out->floppy_a, config.floppy_a, sizeof(out->floppy_a));
+    memcpy(out->floppy_b, config.floppy_b, sizeof(out->floppy_b));
     out->zip_mode = config.zip_mode;
     out->cpu_filter = config.cpu_filter;
     out->cpu_range_count = config.cpu_range_count;

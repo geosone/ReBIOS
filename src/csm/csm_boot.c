@@ -73,6 +73,7 @@ extern const uint8_t csm_thunk_end[];
 #define BOOT_ORDER 0xf100
 #define TABLES_END 0x10000
 #define FLOPPY_A (TABLES_END - HANDOFF_FLOPPY_MODEL_MAX)
+#define FLOPPY_B (FLOPPY_A - HANDOFF_FLOPPY_MODEL_MAX)
 #define LOW_PMM_BASE 0x10000
 #define LOW_PMM_SIZE 0x80000
 #define ROM_AREA_BASE 0xc0000
@@ -455,7 +456,7 @@ static void pci_interrupts(void) {
 // tables loses its last lines.
 static void boot_order(void) {
     const char *list = core_handoff->boot_order;
-    size_t room = FLOPPY_A - BOOT_ORDER - 1;
+    size_t room = FLOPPY_B - BOOT_ORDER - 1;
     size_t length = 0;
     while (length < HANDOFF_MAX_BOOT_ORDER && list[length] != 0) {
         length++;
@@ -582,8 +583,15 @@ void csm_boot_start(struct vcpu *v) {
                HANDOFF_FLOPPY_MODEL_MAX);
         csm.compat16->floppy_a_pointer = FLOPPY_A;
     }
-    if (csm.compat16->table_length >= sizeof(struct csm_compat16_table)) {
+    if (csm.compat16->table_length
+     >= offsetof(struct csm_compat16_table, floppy_b_pointer)) {
         csm.compat16->zip_mode = core_handoff->config.zip_mode + 1;
+    }
+    if (csm.compat16->table_length >= sizeof(struct csm_compat16_table)
+     && core_handoff->config.floppy_b[0] != 0) {
+        memcpy(layout_low(FLOPPY_B), core_handoff->config.floppy_b,
+               HANDOFF_FLOPPY_MODEL_MAX);
+        csm.compat16->floppy_b_pointer = FLOPPY_B;
     }
     bool rsdp_failed = acpi
         && !csm_copy_rsdp(

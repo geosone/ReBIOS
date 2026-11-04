@@ -1,12 +1,12 @@
 diff --git a/src/block.h b/src/block.h
-index 130225f0..d010a7f0 100644
+index 130225f0..75a8ae13 100644
 --- a/src/block.h
 +++ b/src/block.h
 @@ -47,6 +47,7 @@ struct chs_s {
  
  struct drive_s {
      u8 type;            // Driver type (DTYPE_*)
-+    u8 floppy_a;        // Reserve BIOS floppy drive 00h for this device.
++    u8 floppy_slot;     // FLOPPY_SLOT_* bits: floppy_a/floppy_b name it.
      u8 floppy_type;     // Type of floppy (only for floppy drives).
      struct chs_s lchs;  // Logical CHS
      u64 sectors;        // Total sectors count
@@ -20,11 +20,70 @@ index 130225f0..d010a7f0 100644
  };
  
  #define DISK_SECTOR_SIZE  512
+@@ -87,6 +91,10 @@ struct drive_s {
+ #define DTYPE_NVME         0x91
+ #define DTYPE_REBIOS_USB   0x92
+ 
++// Drives reserved as BIOS floppy drive 00h (A:) or 01h (B:).
++#define FLOPPY_SLOT_A 0x01
++#define FLOPPY_SLOT_B 0x02
++
+ #define MAXDESCSIZE 80
+ 
+ #define TRANSLATION_NONE  0
 diff --git a/src/boot.c b/src/boot.c
-index fb494577..0dd4c540 100644
+index fb494577..45dda3c2 100644
 --- a/src/boot.c
 +++ b/src/boot.c
-@@ -835,8 +835,13 @@ add_bev(int type, u32 vector)
+@@ -17,6 +17,7 @@
+ #include "malloc.h" // free
+ #include "output.h" // dprintf
+ #include "romfile.h" // romfile_loadint
++#include "hw/atapi-floppy.h" // atapi_model_upper
+ #include "std/disk.h" // struct mbr_s
+ #include "string.h" // memset
+ #include "util.h" // irqtimer_calc
+@@ -96,6 +97,39 @@ build_ata_path(char *buf, int max,
+ }
+ 
+ 
++// FLOPPY_SLOT_* bits of an ATA or AHCI drive that etc/floppy-a or
++// etc/floppy-b names by its port rather than its model: by its name in
++// SeaBIOS's log ("ata1-0", "AHCI/2"), or by its boot order path
++// ("/pci@i0cf8/*@17/drive@2/disk@0"). Two drives of one model are told apart
++// this way.
++int
++floppy_slot_port(struct pci_device *pci, int chanid, int slave, const char *name)
++{
++    static const char *const files[] = { "etc/floppy-a", "etc/floppy-b" };
++    char path[256];
++    if (pci)
++        build_ata_path(path, sizeof(path), pci, chanid, slave);
++    int slot = 0, i;
++    for (i = 0; i < ARRAY_SIZE(files); i++) {
++        char *wanted = romfile_loadfile(files[i], NULL);
++        if (!wanted)
++            continue;
++        const char *w = wanted, *n = name;
++        while (*w && *n && atapi_model_upper(*w) == atapi_model_upper(*n)) {
++            w++;
++            n++;
++        }
++        const char *rest;
++        if ((*wanted && !*w && !*n)
++            || (pci && wanted[0] == '/' && (rest = glob_prefix(path, wanted))
++                && !*rest))
++            slot |= 1 << i;
++        free(wanted);
++    }
++    return slot;
++}
++
++
+ /****************************************************************
+  * Boot device logical geometry
+  ****************************************************************/
+@@ -835,8 +869,13 @@ add_bev(int type, u32 vector)
  {
      if (type == IPL_TYPE_HARDDISK && HaveHDBoot++)
          return;
@@ -40,43 +99,60 @@ index fb494577..0dd4c540 100644
      if (BEVCount >= ARRAY_SIZE(BEV))
          return;
      struct bev_s *bev = &BEV[BEVCount++];
-@@ -855,8 +860,21 @@ bcv_prepboot(void)
+@@ -855,8 +894,38 @@ bcv_prepboot(void)
      if (haltprio >= 0)
          bootentry_add(IPL_TYPE_HALT, haltprio, 0, "HALT");
  
-+    // Reserve a configured ATAPI floppy as A: independently of boot order.
-+    struct bootentry_s *pos, *floppy_a = NULL;
-+    int matches = 0;
++    // Reserve the ATAPI floppies floppy_a and floppy_b name as A: and B:,
++    // independently of boot order. Of several drives a name matches (two
++    // LS-120s of one model for both), the first in boot order is taken.
++    struct bootentry_s *pos, *floppy_a = NULL, *floppy_b = NULL, *first = NULL;
 +    hlist_for_each_entry(pos, &BootList, node) {
-+        if (pos->type == IPL_TYPE_FLOPPY && pos->drive->floppy_a) {
++        if (pos->type != IPL_TYPE_FLOPPY)
++            continue;
++        u8 slot = pos->drive->floppy_slot;
++        if (!floppy_a && (slot & FLOPPY_SLOT_A))
 +            floppy_a = pos;
-+            matches++;
-+        }
++        else if (!floppy_b && (slot & FLOPPY_SLOT_B))
++            floppy_b = pos;
 +    }
-+    if (matches == 1)
++    if (floppy_b && !floppy_a) {
++        // B: needs an A: before it: the first other floppy drive.
++        hlist_for_each_entry(pos, &BootList, node) {
++            if (pos->type == IPL_TYPE_FLOPPY && pos != floppy_b) {
++                first = pos;
++                break;
++            }
++        }
++        if (!first)
++            dprintf(1, "floppy_b: no other floppy drive for A:\n");
++    }
++    if (floppy_a)
 +        map_floppy_drive(floppy_a->drive);
-+    else if (matches > 1)
-+        dprintf(1, "floppy_a matches multiple drives; using boot order\n");
++    if (first)
++        map_floppy_drive(first->drive);
++    if (floppy_b)
++        map_floppy_drive(floppy_b->drive);
 +
      // Map drives and populate BEV list
 -    struct bootentry_s *pos;
      hlist_for_each_entry(pos, &BootList, node) {
          switch (pos->type) {
          case IPL_TYPE_BCV:
-@@ -864,8 +882,10 @@ bcv_prepboot(void)
+@@ -864,8 +933,10 @@ bcv_prepboot(void)
              add_bev(IPL_TYPE_HARDDISK, 0);
              break;
          case IPL_TYPE_FLOPPY:
 -            map_floppy_drive(pos->drive);
 -            add_bev(IPL_TYPE_FLOPPY, 0);
-+            if (matches != 1 || pos != floppy_a)
++            if (pos != floppy_a && pos != floppy_b && pos != first)
 +                map_floppy_drive(pos->drive);
 +            add_bev(IPL_TYPE_FLOPPY,
 +                    getDriveId(EXTTYPE_FLOPPY, pos->drive));
              break;
          case IPL_TYPE_HARDDISK:
              map_hd_drive(pos->drive);
-@@ -1025,7 +1045,7 @@ do_boot(int seq_nr)
+@@ -1025,7 +1096,7 @@ do_boot(int seq_nr)
      switch (ie->type) {
      case IPL_TYPE_FLOPPY:
          printf("Booting from Floppy...\n");
@@ -236,10 +312,10 @@ index 0328fbd1..e099e0b6 100644
      switch (regs->ah) {
      case 0x00:
 diff --git a/src/fw/csm.c b/src/fw/csm.c
-index b632d282..2a476761 100644
+index b632d282..783d4d89 100644
 --- a/src/fw/csm.c
 +++ b/src/fw/csm.c
-@@ -72,10 +72,19 @@ csm_return(struct bregs *regs)
+@@ -72,10 +72,23 @@ csm_return(struct bregs *regs)
  void
  csm_romfile_init(void)
  {
@@ -256,6 +332,10 @@ index b632d282..2a476761 100644
 +        char *model = (void *)csm_compat_table.FloppyAPointer;
 +        const_romfile_add("etc/floppy-a", model, strlen(model));
 +    }
++    if (csm_compat_table.FloppyBPointer) {
++        char *model = (void *)csm_compat_table.FloppyBPointer;
++        const_romfile_add("etc/floppy-b", model, strlen(model));
++    }
 +    if (csm_compat_table.ZipMode)
 +        const_romfile_add("etc/zip-mode", &csm_compat_table.ZipMode,
 +                          sizeof(csm_compat_table.ZipMode));
@@ -263,7 +343,7 @@ index b632d282..2a476761 100644
  
  static void
 diff --git a/src/hw/ahci.c b/src/hw/ahci.c
-index 56f10ac1..56133293 100644
+index 56f10ac1..a81d275d 100644
 --- a/src/hw/ahci.c
 +++ b/src/hw/ahci.c
 @@ -279,7 +279,8 @@ ahci_atapi_issue(struct ahci_port_s *port_gf, struct disk_op_s *op,
@@ -338,17 +418,21 @@ index 56f10ac1..56133293 100644
          port->prio = bootprio_find_ahci_device(ctrl->pci_tmp, pnr, 1);
      }
      boot_lchs_find_ata_device(ctrl->pci_tmp, pnr, 0, &(port->drive.lchs));
-@@ -721,6 +732,8 @@ ahci_port_detect(void *data)
+@@ -721,6 +732,12 @@ ahci_port_detect(void *data)
          if (!port->atapi) {
              // Register with bcv system.
              boot_add_hd(&port->drive, port->desc, port->prio);
 +        } else if (port->atapi == 2) {
++            char name[16];
++            snprintf(name, sizeof(name), "AHCI/%d", port->pnr);
++            port->drive.floppy_slot = floppy_slot_port(
++                port->ctrl->pci_tmp, port->pnr, 0, name);
 +            atapi_drive_setup(&port->drive, port->desc, port->prio);
          } else {
              // fill cdidmap
              boot_add_cd(&port->drive, port->desc, port->prio);
 diff --git a/src/hw/ata.c b/src/hw/ata.c
-index f788ce71..9ef29d78 100644
+index f788ce71..ef37056a 100644
 --- a/src/hw/ata.c
 +++ b/src/hw/ata.c
 @@ -589,8 +589,11 @@ ata_atapi_process_op(struct disk_op_s *op)
@@ -383,7 +467,7 @@ index f788ce71..9ef29d78 100644
                            , adrive->chan_gf->ataid, adrive->slave
                            , ata_extract_model(model, MAXMODEL, buffer)
                            , ata_extract_version(buffer)
-@@ -760,6 +764,14 @@ init_drive_atapi(struct atadrive_s *dummy, u16 *buffer)
+@@ -760,6 +764,20 @@ init_drive_atapi(struct atadrive_s *dummy, u16 *buffer)
                                    adrive->slave,
                                    &(adrive->drive.lchs));
          boot_add_cd(&adrive->drive, desc, prio);
@@ -394,6 +478,12 @@ index f788ce71..9ef29d78 100644
 +        boot_lchs_find_ata_device(adrive->chan_gf->pci_tmp,
 +                                 adrive->chan_gf->chanid,
 +                                 adrive->slave, &adrive->drive.lchs);
++        char name[16];
++        snprintf(name, sizeof(name), "ata%d-%d"
++                 , adrive->chan_gf->ataid, adrive->slave);
++        adrive->drive.floppy_slot = floppy_slot_port(
++            adrive->chan_gf->pci_tmp, adrive->chan_gf->chanid, adrive->slave
++            , name);
 +        atapi_drive_setup(&adrive->drive, model, prio);
      }
  
@@ -633,7 +723,7 @@ index 00000000..39e07e68
 +
 +#endif
 diff --git a/src/hw/blockcmd.c b/src/hw/blockcmd.c
-index 426883d3..04943bea 100644
+index 426883d3..3ea31e08 100644
 --- a/src/hw/blockcmd.c
 +++ b/src/hw/blockcmd.c
 @@ -6,6 +6,7 @@
@@ -870,7 +960,7 @@ index 426883d3..04943bea 100644
  // Validate drive, find block size / sector count, and register drive.
  int
  scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
-@@ -354,7 +539,55 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+@@ -354,7 +539,67 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
      if (pdt != SCSI_TYPE_DISK)
          return -1;
  
@@ -878,28 +968,40 @@ index 426883d3..04943bea 100644
 +    // the drive's identity in INQUIRY.
 +    int is_atapi = drive->type == DTYPE_ATA_ATAPI
 +        || drive->type == DTYPE_AHCI_ATAPI;
-+    int floppy_a = 0;
++    // Named by its port (floppy_slot_port), or else by its model.
++    int floppy_slot = is_atapi ? drive->floppy_slot : 0;
 +    if (is_atapi) {
-+        char *wanted = romfile_loadfile("etc/floppy-a", NULL);
-+        floppy_a = wanted && *wanted
-+            && (atapi_model_matches(s, wanted)
-+                || atapi_model_matches(product, wanted));
-+        free(wanted);
++        static const char *const files[] = { "etc/floppy-a", "etc/floppy-b" };
++        int i;
++        for (i = 0; i < ARRAY_SIZE(files); i++) {
++            char *wanted = romfile_loadfile(files[i], NULL);
++            // Port names are matched by floppy_slot_port alone.
++            int port = wanted && (wanted[0] == '/'
++                                  || atapi_model_matches(wanted, "AHCI/")
++                                  || (atapi_model_upper(wanted[0]) == 'A'
++                                      && atapi_model_upper(wanted[1]) == 'T'
++                                      && atapi_model_upper(wanted[2]) == 'A'
++                                      && wanted[3] >= '0' && wanted[3] <= '9'));
++            if (wanted && *wanted && !port && (atapi_model_matches(s, wanted)
++                                      || atapi_model_matches(product, wanted)))
++                floppy_slot |= 1 << i;
++            free(wanted);
++        }
 +    }
 +    // A ZIP is a floppy or a hard disk as etc/zip-mode says; in auto mode
 +    // (the default) by its media below.
-+    int zip = is_atapi && !floppy_a && atapi_is_zip(vendor, product, s);
++    int zip = is_atapi && !floppy_slot && atapi_is_zip(vendor, product, s);
 +    int zip_mode = zip ? romfile_loadint("etc/zip-mode", ATAPI_ZIP_AUTO) : 0;
 +    if (zip)
 +        dprintf(1, "%s: ZIP mode %d\n", s, zip_mode);
-+    // The drive named by floppy_a is a floppy even if its model does not
-+    // say so.
++    // A drive named by floppy_a or floppy_b is a floppy even if its model
++    // does not say so.
 +    int atapi_floppy = is_atapi
-+        && (drive->floppy_type || atapi_is_superdisk(product) || floppy_a
++        && (drive->floppy_type || atapi_is_superdisk(product) || floppy_slot
 +            || (zip && zip_mode != ATAPI_ZIP_HDD));
 +    if (atapi_floppy) {
 +        drive->floppy_type = ATAPI_FLOPPY_TYPE_ARMD;
-+        drive->floppy_a = floppy_a;
++        drive->floppy_slot = floppy_slot;
 +        drive->media = malloc_low(sizeof(*drive->media));
 +        if (!drive->media) {
 +            warn_noalloc();
@@ -926,7 +1028,7 @@ index 426883d3..04943bea 100644
      if (ret) {
          dprintf(1, "scsi_is_ready returned %d\n", ret);
          return ret;
-@@ -409,8 +642,45 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
+@@ -409,8 +654,45 @@ scsi_drive_setup(struct drive_s *drive, const char *s, int prio)
          }
      }
  
@@ -987,10 +1089,10 @@ index 2683186c..50e83e8e 100644
  int scsi_rep_luns_scan(struct drive_s *tmp_drive, scsi_add_lun add_lun);
  int scsi_sequential_scan(struct drive_s *tmp_drive, u32 maxluns,
 diff --git a/src/std/LegacyBios.h b/src/std/LegacyBios.h
-index 1719f7ff..3f6adefa 100644
+index 1719f7ff..e1bb9d18 100644
 --- a/src/std/LegacyBios.h
 +++ b/src/std/LegacyBios.h
-@@ -276,6 +276,10 @@ typedef struct {
+@@ -276,6 +276,12 @@ typedef struct {
    /// priorities. Zero if the loader does not provide a list.
    ///
    UINT32                            BootOrderPointer;
@@ -998,15 +1100,30 @@ index 1719f7ff..3f6adefa 100644
 +  UINT32                            FloppyAPointer;
 +  // How an ATAPI ZIP drive is mapped: 0 unset, 1 auto, 2 floppy, 3 hard disk.
 +  UINT32                            ZipMode;
++  // NUL-terminated model substring for the ATAPI floppy reserved as B:.
++  UINT32                            FloppyBPointer;
  } EFI_COMPATIBILITY16_TABLE;
  
  ///
+diff --git a/src/util.h b/src/util.h
+index 425f2f22..0b8635f8 100644
+--- a/src/util.h
++++ b/src/util.h
+@@ -35,6 +35,8 @@ int bootprio_find_scsi_device(struct pci_device *pci, int target, int lun);
+ int bootprio_find_scsi_mmio_device(void *mmio, int target, int lun);
+ int bootprio_find_ata_device(struct pci_device *pci, int chanid, int slave);
+ int bootprio_find_ahci_device(struct pci_device *pci, int port, int cdrom);
++int floppy_slot_port(struct pci_device *pci, int chanid, int slave
++                     , const char *name);
+ int bootprio_find_fdc_device(struct pci_device *pci, int port, int fdid);
+ int bootprio_find_pci_rom(struct pci_device *pci, int instance);
+ int bootprio_find_named_rom(const char *name, int instance);
 diff --git a/tests/README.md b/tests/README.md
 new file mode 100644
-index 00000000..58d8b563
+index 00000000..52545731
 --- /dev/null
 +++ b/tests/README.md
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,120 @@
 +ATAPI removable media checks
 +===========================
 +
@@ -1032,6 +1149,17 @@ index 00000000..58d8b563
 +
 +Real hardware validation is still required for IDE-to-SATA ATAPI bridges
 +and the AHCI controller path. Low-level formatting is rejected.
++
++`etc/floppy-a` and `etc/floppy-b` (ReBIOS's `floppy_a`, `floppy_b`) reserve
++BIOS floppy drives 00h and 01h, A: and B:. They name a drive by part of its
++model, or by its port: its SeaBIOS name (`ata1-0`, `AHCI/2`) or its boot
++order path (`/pci@i0cf8/*@17/drive@2/disk@0`), which tells two drives of one
++model apart. Of several drives a model name matches, the first in boot
++order is taken; the same name for both gives A: to the first and B: to the
++second. A named drive is a floppy drive, a ZIP too. In 86Box, two LS-120s
++named by port (reversed from their channel order) became A: and B: as
++named, and `DISKCOPY A: B:` and `DISKCOMP A: B:` passed; two ZIPs named by
++port became A: and B:.
 +
 +A ZIP is mapped as the `etc/zip-mode` ROM file says (ReBIOS's `zip_mode`):
 +in auto mode (the default) by its media at POST, a hard disk when sector 0

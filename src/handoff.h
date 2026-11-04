@@ -174,6 +174,8 @@ struct handoff_config {
     uint8_t legacy_usb;
     // Model substring of an ATAPI LS-120 to reserve as BIOS drive 00h.
     char floppy_a[HANDOFF_FLOPPY_MODEL_MAX];
+    // The same for BIOS drive 01h, B:.
+    char floppy_b[HANDOFF_FLOPPY_MODEL_MAX];
     // How an ATAPI ZIP drive is mapped: by its media at boot (partitioned:
     // hard disk, else floppy), or always as a floppy or a hard disk.
     uint8_t zip_mode;
